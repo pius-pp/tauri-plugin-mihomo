@@ -417,12 +417,12 @@ class MihomoWebSocket {
                 id: this.id,
                 forceTimeout: 0,
             });
-            this.listeners.clear();
         }
         catch (ignore) {
             // ignore
         }
         finally {
+            this.listeners.clear();
             MihomoWebSocket.instances.delete(this);
         }
     }

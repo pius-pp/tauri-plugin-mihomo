@@ -1,5 +1,9 @@
 #![allow(dead_code)]
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use http::{
@@ -8,6 +12,7 @@ use http::{
 };
 use reqwest::{Method, RequestBuilder};
 use serde_json::json;
+use tauri::async_runtime::Mutex;
 use tokio_tungstenite::{
     client_async, connect_async,
     tungstenite::{Message, client::IntoClientRequest, protocol::CloseFrame as ProtocolCloseFrame},
@@ -25,6 +30,29 @@ use crate::{
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+type WsReaderKey = (usize, ConnectionId);
+
+static WS_READER_CANCELLATIONS: LazyLock<Mutex<HashMap<WsReaderKey, tokio::sync::oneshot::Sender<()>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn ws_reader_key(manager: &Arc<ConnectionManager>, id: ConnectionId) -> WsReaderKey {
+    (Arc::as_ptr(manager) as usize, id)
+}
+
+async fn track_ws_reader(key: WsReaderKey, cancel_reader: tokio::sync::oneshot::Sender<()>) {
+    WS_READER_CANCELLATIONS.lock().await.insert(key, cancel_reader);
+}
+
+async fn cancel_ws_reader(key: WsReaderKey) {
+    if let Some(cancel_reader) = WS_READER_CANCELLATIONS.lock().await.remove(&key) {
+        let _ = cancel_reader.send(());
+    }
+}
+
+async fn untrack_ws_reader(key: WsReaderKey) {
+    WS_READER_CANCELLATIONS.lock().await.remove(&key);
+}
 
 pub struct Mihomo {
     pub protocol: Protocol,
@@ -159,7 +187,7 @@ impl Mihomo {
     /// 连接 WebSocket
     async fn connect<F>(&self, url: String, on_message: F) -> Result<ConnectionId>
     where
-        F: Fn(serde_json::Value) + Send + 'static,
+        F: Fn(serde_json::Value) -> bool + Send + 'static,
     {
         let id = rand::random();
         log::info!("connecting to websocket: {url}, id: {id}");
@@ -195,29 +223,52 @@ impl Mihomo {
                 let request = url.into_client_request()?;
                 let (ws_stream, _) = connect_async(request).await?;
                 let (writer, mut reader) = ws_stream.split();
+                let (cancel_reader, mut cancel_reader_rx) = tokio::sync::oneshot::channel();
+                let reader_key = ws_reader_key(&manager, id);
 
                 manager
                     .0
                     .write()
                     .await
                     .insert(id, WebSocketWriter::TcpStreamWriter(writer));
+                track_ws_reader(reader_key, cancel_reader).await;
 
                 tokio::spawn(async move {
                     let manager_ = Arc::clone(&manager);
                     loop {
-                        let ids: Vec<u32> = manager_.0.read().await.keys().cloned().collect();
-                        log::trace!("waiting for websocket message, connection_id: {id}, manager_ids: {ids:?}",);
-                        if !ids.contains(&id) {
-                            log::debug!("connection [{id}] is removed from manager");
-                            break;
-                        }
-                        if let Some(message) = reader.next().await {
-                            if let Ok(Message::Close(_)) = message {
-                                log::debug!("connection [{id}] is closed");
-                                manager_.0.write().await.remove(&id);
+                        log::trace!("waiting for websocket message, connection_id: {id}");
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancel_reader_rx => {
+                                log::debug!("connection [{id}] reader cancelled");
+                                break;
                             }
-                            let response = handle_message(message);
-                            on_message(response);
+                            message = reader.next() => {
+                                match message {
+                                    Some(message) => {
+                                        let should_close = matches!(message, Ok(Message::Close(_)) | Err(_));
+                                        if matches!(message, Ok(Message::Close(_))) {
+                                            log::debug!("connection [{id}] is closed");
+                                        }
+                                        let response = handle_message(message);
+                                        let keep_reader = on_message(response);
+                                        if should_close || !keep_reader {
+                                            if !keep_reader {
+                                                log::debug!("message receiver dropped, closing websocket connection [{id}]");
+                                            }
+                                            manager_.0.write().await.remove(&id);
+                                            untrack_ws_reader(reader_key).await;
+                                            break;
+                                        }
+                                    }
+                                    None => {
+                                        log::debug!("connection [{id}] stream ended");
+                                        manager_.0.write().await.remove(&id);
+                                        untrack_ws_reader(reader_key).await;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                 });
@@ -239,29 +290,52 @@ impl Mihomo {
                         .body(())?;
                     let (ws_stream, _) = client_async(request, stream).await?;
                     let (writer, mut reader) = ws_stream.split();
+                    let (cancel_reader, mut cancel_reader_rx) = tokio::sync::oneshot::channel();
+                    let reader_key = ws_reader_key(&manager, id);
 
                     manager
                         .0
                         .write()
                         .await
                         .insert(id, WebSocketWriter::SocketStreamWriter(writer));
+                    track_ws_reader(reader_key, cancel_reader).await;
 
                     tokio::spawn(async move {
                         let manager_ = Arc::clone(&manager);
                         loop {
-                            let ids: Vec<u32> = manager_.0.read().await.keys().cloned().collect();
-                            log::trace!("waiting for websocket message, connection_id: {id}, manager_ids: {ids:?}",);
-                            if !ids.contains(&id) {
-                                log::debug!("connection [{id}] is removed from manager");
-                                break;
-                            }
-                            if let Some(message) = reader.next().await {
-                                if let Ok(Message::Close(_)) = message {
-                                    log::debug!("connection [{id}] closed");
-                                    manager_.0.write().await.remove(&id);
+                            log::trace!("waiting for websocket message, connection_id: {id}");
+                            tokio::select! {
+                                biased;
+                                _ = &mut cancel_reader_rx => {
+                                    log::debug!("connection [{id}] reader cancelled");
+                                    break;
                                 }
-                                let response = handle_message(message);
-                                on_message(response);
+                                message = reader.next() => {
+                                    match message {
+                                        Some(message) => {
+                                            let should_close = matches!(message, Ok(Message::Close(_)) | Err(_));
+                                            if matches!(message, Ok(Message::Close(_))) {
+                                                log::debug!("connection [{id}] closed");
+                                            }
+                                            let response = handle_message(message);
+                                            let keep_reader = on_message(response);
+                                            if should_close || !keep_reader {
+                                                if !keep_reader {
+                                                    log::debug!("message receiver dropped, closing websocket connection [{id}]");
+                                                }
+                                                manager_.0.write().await.remove(&id);
+                                                untrack_ws_reader(reader_key).await;
+                                                break;
+                                            }
+                                        }
+                                        None => {
+                                            log::debug!("connection [{id}] stream ended");
+                                            manager_.0.write().await.remove(&id);
+                                            untrack_ws_reader(reader_key).await;
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
                     });
@@ -303,36 +377,36 @@ impl Mihomo {
     /// 取消 WebSocket 连接
     pub async fn disconnect(&self, id: ConnectionId, force_timeout: Option<u64>) -> Result<()> {
         log::debug!("disconnecting connection: {id}");
-        let mut manager = self.connection_manager.0.write().await;
-        if let Some(writer) = manager.get_mut(&id) {
-            let close_message = Message::Close(Some(ProtocolCloseFrame {
-                code: 1000.into(),
-                reason: "Disconnected by client".into(),
-            }));
-            // ignore send error
-            let _ = writer.send(close_message).await;
-            if let Some(timeout) = force_timeout {
-                let manager_ = Arc::clone(&self.connection_manager);
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(timeout)).await;
-                    log::debug!("force close websocket connection");
-                    manager_.0.write().await.remove(&id);
-                });
-            }
-            Ok(())
-        } else {
+        let Some(mut writer) = self.connection_manager.0.write().await.remove(&id) else {
             log::error!("connection not found: {id}");
-            Err(Error::ConnectionNotFound(id))
+            return Err(Error::ConnectionNotFound(id));
+        };
+
+        cancel_ws_reader(ws_reader_key(&self.connection_manager, id)).await;
+        let close_message = Message::Close(Some(ProtocolCloseFrame {
+            code: 1000.into(),
+            reason: "Disconnected by client".into(),
+        }));
+
+        if let Some(timeout) = force_timeout.filter(|timeout| *timeout > 0) {
+            let _ = tokio::time::timeout(Duration::from_millis(timeout), writer.send(close_message)).await;
+        } else {
+            let _ = writer.send(close_message).await;
         }
+        Ok(())
     }
 
     pub async fn clear_all_ws_connections(&self) -> Result<()> {
         log::debug!("start to clear all websocket connections");
         let mut manager = self.connection_manager.0.write().await;
         log::debug!("manage_ids: {:?}", manager.keys());
+        let ids: Vec<_> = manager.keys().copied().collect();
         manager.clear();
         log::debug!("clear all done, manager_ids: {:?}", manager.keys());
         drop(manager);
+        for id in ids {
+            cancel_ws_reader(ws_reader_key(&self.connection_manager, id)).await;
+        }
         Ok(())
     }
 
@@ -344,9 +418,19 @@ impl Mihomo {
     where
         F: Fn(serde_json::Value) + Send + 'static,
     {
+        self.ws_traffic_checked(move |data| {
+            on_message(data);
+            true
+        })
+        .await
+    }
+
+    pub(crate) async fn ws_traffic_checked<F>(&self, on_message: F) -> Result<ConnectionId>
+    where
+        F: Fn(serde_json::Value) -> bool + Send + 'static,
+    {
         let ws_url = self.get_websocket_url("/traffic")?;
-        let websocket_id = self.connect(ws_url, on_message).await?;
-        Ok(websocket_id)
+        self.connect(ws_url, on_message).await
     }
 
     /// WebSocket: Mihomo 内存使用数据
@@ -354,9 +438,19 @@ impl Mihomo {
     where
         F: Fn(serde_json::Value) + Send + 'static,
     {
+        self.ws_memory_checked(move |data| {
+            on_message(data);
+            true
+        })
+        .await
+    }
+
+    pub(crate) async fn ws_memory_checked<F>(&self, on_message: F) -> Result<ConnectionId>
+    where
+        F: Fn(serde_json::Value) -> bool + Send + 'static,
+    {
         let ws_url = self.get_websocket_url("/memory")?;
-        let websocket_id = self.connect(ws_url, on_message).await?;
-        Ok(websocket_id)
+        self.connect(ws_url, on_message).await
     }
 
     /// WebSocket: Mihomo 连接信息数据
@@ -364,15 +458,36 @@ impl Mihomo {
     where
         F: Fn(serde_json::Value) + Send + 'static,
     {
+        self.ws_connections_checked(move |data| {
+            on_message(data);
+            true
+        })
+        .await
+    }
+
+    pub(crate) async fn ws_connections_checked<F>(&self, on_message: F) -> Result<ConnectionId>
+    where
+        F: Fn(serde_json::Value) -> bool + Send + 'static,
+    {
         let ws_url = self.get_websocket_url("/connections")?;
-        let websocket_id = self.connect(ws_url, on_message).await?;
-        Ok(websocket_id)
+        self.connect(ws_url, on_message).await
     }
 
     /// WebSocket: Mihomo 日志数据
     pub async fn ws_logs<F>(&self, level: LogLevel, on_message: F) -> Result<ConnectionId>
     where
         F: Fn(serde_json::Value) + Send + 'static,
+    {
+        self.ws_logs_checked(level, move |data| {
+            on_message(data);
+            true
+        })
+        .await
+    }
+
+    pub(crate) async fn ws_logs_checked<F>(&self, level: LogLevel, on_message: F) -> Result<ConnectionId>
+    where
+        F: Fn(serde_json::Value) -> bool + Send + 'static,
     {
         let ws_url = self.get_websocket_url("/logs")?;
         let ws_url = match self.protocol {
@@ -381,8 +496,7 @@ impl Mihomo {
             Protocol::Http => format!("{ws_url}&level={level}"),
             Protocol::LocalSocket => format!("{ws_url}?level={level}"),
         };
-        let websocket_id = self.connect(ws_url, on_message).await?;
-        Ok(websocket_id)
+        self.connect(ws_url, on_message).await
     }
 
     // clash api
