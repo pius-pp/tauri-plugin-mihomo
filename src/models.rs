@@ -880,22 +880,6 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Eq)]
-pub struct CloseFrame {
-    pub code: u16,
-    pub reason: String,
-}
-
-#[derive(Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "type", content = "data")]
-pub enum WebSocketMessage {
-    Text(String),
-    Binary(Vec<u8>),
-    Ping(Vec<u8>),
-    Pong(Vec<u8>),
-    Close(Option<CloseFrame>),
-}
-
 pub type ConnectionId = u32;
 pub enum WebSocketWriter {
     TcpStreamWriter(SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>),

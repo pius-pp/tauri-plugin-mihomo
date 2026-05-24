@@ -191,11 +191,7 @@ export interface MessageKind<T, D> {
     type: T;
     data: D;
 }
-export interface CloseFrame {
-    code: number;
-    reason: string;
-}
-export type Message = MessageKind<"Text", string> | MessageKind<"Binary", number[]> | MessageKind<"Ping", number[]> | MessageKind<"Pong", number[]> | MessageKind<"Close", CloseFrame | null>;
+export type Message = MessageKind<"Text", string>;
 export declare class MihomoWebSocket {
     id: number;
     private readonly listeners;

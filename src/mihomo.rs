@@ -12,7 +12,7 @@ use http::{
 };
 use reqwest::{Method, RequestBuilder};
 use serde_json::json;
-use tauri::async_runtime::Mutex;
+use tauri::{async_runtime::Mutex, ipc::InvokeResponseBody};
 use tokio_tungstenite::{
     client_async, connect_async,
     tungstenite::{Message, client::IntoClientRequest, protocol::CloseFrame as ProtocolCloseFrame},
@@ -22,9 +22,9 @@ use crate::{
     Error, IpcConnectionPool, Result,
     ipc::LocalSocket,
     models::{
-        BaseConfig, CloseFrame, ConnectionId, ConnectionManager, Connections, CoreUpdaterChannel, ErrorResponse,
-        Groups, LogLevel, MihomoVersion, Protocol, Proxies, Proxy, ProxyDelay, ProxyProvider, ProxyProviders,
-        RuleProviders, Rules, WebSocketMessage, WebSocketWriter,
+        BaseConfig, ConnectionId, ConnectionManager, Connections, CoreUpdaterChannel, ErrorResponse, Groups, LogLevel,
+        MihomoVersion, Protocol, Proxies, Proxy, ProxyDelay, ProxyProvider, ProxyProviders, RuleProviders, Rules,
+        WebSocketWriter,
     },
     ret_failed_resp, utils,
 };
@@ -38,6 +38,44 @@ static WS_READER_CANCELLATIONS: LazyLock<Mutex<HashMap<WsReaderKey, tokio::sync:
 
 fn ws_reader_key(manager: &Arc<ConnectionManager>, id: ConnectionId) -> WsReaderKey {
     (Arc::as_ptr(manager) as usize, id)
+}
+
+fn raw_text_channel_body(text: &str) -> InvokeResponseBody {
+    InvokeResponseBody::Raw(text.as_bytes().to_vec())
+}
+
+fn websocket_message_to_channel_body(
+    message: std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
+) -> (Option<InvokeResponseBody>, bool) {
+    match message {
+        Ok(Message::Text(text)) => (Some(raw_text_channel_body(&text)), false),
+        Ok(Message::Close(_)) => (None, true),
+        Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => (None, false),
+        Err(err) => {
+            log::error!("websocket error: {err}");
+            let error_message = Error::from(err).to_string();
+            (Some(raw_text_channel_body(&error_message)), true)
+        }
+    }
+}
+
+fn channel_body_to_text_bytes(body: InvokeResponseBody) -> Option<Vec<u8>> {
+    match body {
+        InvokeResponseBody::Raw(bytes) => Some(bytes),
+        InvokeResponseBody::Json(_) => None,
+    }
+}
+
+fn forward_channel_text<F>(on_message: F) -> impl Fn(InvokeResponseBody) -> bool + Send + 'static
+where
+    F: Fn(Vec<u8>) + Send + 'static,
+{
+    move |data| {
+        if let Some(bytes) = channel_body_to_text_bytes(data) {
+            on_message(bytes);
+        }
+        true
+    }
 }
 
 async fn track_ws_reader(key: WsReaderKey, cancel_reader: tokio::sync::oneshot::Sender<()>) {
@@ -187,35 +225,11 @@ impl Mihomo {
     /// 连接 WebSocket
     async fn connect<F>(&self, url: String, on_message: F) -> Result<ConnectionId>
     where
-        F: Fn(serde_json::Value) -> bool + Send + 'static,
+        F: Fn(InvokeResponseBody) -> bool + Send + 'static,
     {
         let id = rand::random();
         log::info!("connecting to websocket: {url}, id: {id}");
         let manager = Arc::clone(&self.connection_manager);
-        let handle_message = |message| {
-            let serialize_with_fallback = |ws_message: WebSocketMessage| {
-                serde_json::to_value(ws_message).unwrap_or_else(|err| {
-                    log::error!("Failed to serialize WebSocket message: {err}");
-                    serde_json::Value::Null
-                })
-            };
-
-            match message {
-                Ok(Message::Text(t)) => serialize_with_fallback(WebSocketMessage::Text(t.to_string())),
-                Ok(Message::Binary(t)) => serialize_with_fallback(WebSocketMessage::Binary(t.to_vec())),
-                Ok(Message::Ping(t)) => serialize_with_fallback(WebSocketMessage::Ping(t.to_vec())),
-                Ok(Message::Pong(t)) => serialize_with_fallback(WebSocketMessage::Pong(t.to_vec())),
-                Ok(Message::Close(t)) => serialize_with_fallback(WebSocketMessage::Close(t.map(|v| CloseFrame {
-                    code: v.code.into(),
-                    reason: v.reason.to_string(),
-                }))),
-                Ok(Message::Frame(_)) => serde_json::Value::Null,
-                Err(e) => {
-                    log::error!("websocket error: {e}");
-                    serialize_with_fallback(WebSocketMessage::Text(Error::from(e).to_string()))
-                }
-            }
-        };
 
         match self.protocol {
             Protocol::Http => {
@@ -246,12 +260,11 @@ impl Mihomo {
                             message = reader.next() => {
                                 match message {
                                     Some(message) => {
-                                        let should_close = matches!(message, Ok(Message::Close(_)) | Err(_));
-                                        if matches!(message, Ok(Message::Close(_))) {
+                                        let (response, should_close) = websocket_message_to_channel_body(message);
+                                        if should_close {
                                             log::debug!("connection [{id}] is closed");
                                         }
-                                        let response = handle_message(message);
-                                        let keep_reader = on_message(response);
+                                        let keep_reader = response.is_none_or(&on_message);
                                         if should_close || !keep_reader {
                                             if !keep_reader {
                                                 log::debug!("message receiver dropped, closing websocket connection [{id}]");
@@ -312,13 +325,12 @@ impl Mihomo {
                                 }
                                 message = reader.next() => {
                                     match message {
-                                        Some(message) => {
-                                            let should_close = matches!(message, Ok(Message::Close(_)) | Err(_));
-                                            if matches!(message, Ok(Message::Close(_))) {
+                                    Some(message) => {
+                                            let (response, should_close) = websocket_message_to_channel_body(message);
+                                            if should_close {
                                                 log::debug!("connection [{id}] closed");
                                             }
-                                            let response = handle_message(message);
-                                            let keep_reader = on_message(response);
+                                            let keep_reader = response.is_none_or(&on_message);
                                             if should_close || !keep_reader {
                                                 if !keep_reader {
                                                     log::debug!("message receiver dropped, closing websocket connection [{id}]");
@@ -348,29 +360,6 @@ impl Mihomo {
                     )))
                 }
             }
-        }
-    }
-
-    /// 向指定 WebSocket 连接发送消息 (暂无使用该方法的地方)
-    async fn send(&self, id: ConnectionId, message: WebSocketMessage) -> Result<()> {
-        let manager = Arc::clone(&self.connection_manager);
-        let mut manager = manager.0.write().await;
-        if let Some(writer) = manager.get_mut(&id) {
-            let data = match message {
-                WebSocketMessage::Text(t) => Message::Text(t.into()),
-                WebSocketMessage::Binary(t) => Message::Binary(t.into()),
-                WebSocketMessage::Ping(t) => Message::Ping(t.into()),
-                WebSocketMessage::Pong(t) => Message::Pong(t.into()),
-                WebSocketMessage::Close(t) => Message::Close(t.map(|v| ProtocolCloseFrame {
-                    code: v.code.into(),
-                    reason: v.reason.into(),
-                })),
-            };
-            writer.send(data).await?;
-            Ok(())
-        } else {
-            log::error!("connection not found: {id}");
-            Err(Error::ConnectionNotFound(id))
         }
     }
 
@@ -416,18 +405,14 @@ impl Mihomo {
     /// WebSocket: Mihomo 流量数据
     pub async fn ws_traffic<F>(&self, on_message: F) -> Result<ConnectionId>
     where
-        F: Fn(serde_json::Value) + Send + 'static,
+        F: Fn(Vec<u8>) + Send + 'static,
     {
-        self.ws_traffic_checked(move |data| {
-            on_message(data);
-            true
-        })
-        .await
+        self.ws_traffic_checked(forward_channel_text(on_message)).await
     }
 
     pub(crate) async fn ws_traffic_checked<F>(&self, on_message: F) -> Result<ConnectionId>
     where
-        F: Fn(serde_json::Value) -> bool + Send + 'static,
+        F: Fn(InvokeResponseBody) -> bool + Send + 'static,
     {
         let ws_url = self.get_websocket_url("/traffic")?;
         self.connect(ws_url, on_message).await
@@ -436,18 +421,14 @@ impl Mihomo {
     /// WebSocket: Mihomo 内存使用数据
     pub async fn ws_memory<F>(&self, on_message: F) -> Result<ConnectionId>
     where
-        F: Fn(serde_json::Value) + Send + 'static,
+        F: Fn(Vec<u8>) + Send + 'static,
     {
-        self.ws_memory_checked(move |data| {
-            on_message(data);
-            true
-        })
-        .await
+        self.ws_memory_checked(forward_channel_text(on_message)).await
     }
 
     pub(crate) async fn ws_memory_checked<F>(&self, on_message: F) -> Result<ConnectionId>
     where
-        F: Fn(serde_json::Value) -> bool + Send + 'static,
+        F: Fn(InvokeResponseBody) -> bool + Send + 'static,
     {
         let ws_url = self.get_websocket_url("/memory")?;
         self.connect(ws_url, on_message).await
@@ -456,18 +437,14 @@ impl Mihomo {
     /// WebSocket: Mihomo 连接信息数据
     pub async fn ws_connections<F>(&self, on_message: F) -> Result<ConnectionId>
     where
-        F: Fn(serde_json::Value) + Send + 'static,
+        F: Fn(Vec<u8>) + Send + 'static,
     {
-        self.ws_connections_checked(move |data| {
-            on_message(data);
-            true
-        })
-        .await
+        self.ws_connections_checked(forward_channel_text(on_message)).await
     }
 
     pub(crate) async fn ws_connections_checked<F>(&self, on_message: F) -> Result<ConnectionId>
     where
-        F: Fn(serde_json::Value) -> bool + Send + 'static,
+        F: Fn(InvokeResponseBody) -> bool + Send + 'static,
     {
         let ws_url = self.get_websocket_url("/connections")?;
         self.connect(ws_url, on_message).await
@@ -476,18 +453,14 @@ impl Mihomo {
     /// WebSocket: Mihomo 日志数据
     pub async fn ws_logs<F>(&self, level: LogLevel, on_message: F) -> Result<ConnectionId>
     where
-        F: Fn(serde_json::Value) + Send + 'static,
+        F: Fn(Vec<u8>) + Send + 'static,
     {
-        self.ws_logs_checked(level, move |data| {
-            on_message(data);
-            true
-        })
-        .await
+        self.ws_logs_checked(level, forward_channel_text(on_message)).await
     }
 
     pub(crate) async fn ws_logs_checked<F>(&self, level: LogLevel, on_message: F) -> Result<ConnectionId>
     where
-        F: Fn(serde_json::Value) -> bool + Send + 'static,
+        F: Fn(InvokeResponseBody) -> bool + Send + 'static,
     {
         let ws_url = self.get_websocket_url("/logs")?;
         let ws_url = match self.protocol {
@@ -998,6 +971,99 @@ impl Mihomo {
             );
             ret_failed_resp!("{}", err_msg);
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", content = "data")]
+    enum OldChannelMessage {
+        Text(String),
+    }
+
+    fn old_channel_json(payload: &str) -> serde_json::Result<String> {
+        let value = serde_json::to_value(OldChannelMessage::Text(payload.to_string()))?;
+        serde_json::to_string(&value)
+    }
+
+    fn raw_channel_body_len(payload: &str) -> usize {
+        match raw_text_channel_body(payload) {
+            InvokeResponseBody::Raw(bytes) => {
+                let len = bytes.len();
+                std::hint::black_box(bytes);
+                len
+            }
+            InvokeResponseBody::Json(_) => unreachable!("text websocket messages are sent as raw bytes"),
+        }
+    }
+
+    fn sample_connections_payload(min_len: usize) -> String {
+        let connection = r#"{"id":"bench-id","metadata":{"network":"tcp","type":"HTTP","sourceIP":"198.18.0.1","destinationIP":"93.184.216.34","host":"example.com","dnsMode":"normal","processPath":"/Applications/Example.app"},"chains":["Proxy","DIRECT"],"rule":"MATCH","rulePayload":"","upload":123456,"download":654321,"start":"2026-05-25T00:00:00Z"}"#;
+        let mut payload = String::from(r#"{"downloadTotal":1,"uploadTotal":2,"connections":["#);
+
+        while payload.len() < min_len {
+            if !payload.ends_with('[') {
+                payload.push(',');
+            }
+            payload.push_str(connection);
+        }
+
+        payload.push_str("]}");
+        payload
+    }
+
+    #[test]
+    fn raw_channel_body_can_be_counted_without_json_reparse() -> std::result::Result<(), String> {
+        let payload = r#"{"connections":[{"id":"a","metadata":{"host":"example.com"}}]}"#;
+        let bytes = channel_body_to_text_bytes(raw_text_channel_body(payload))
+            .ok_or_else(|| "raw text channel body did not produce bytes".to_string())?;
+
+        assert_eq!(bytes, payload.as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn compare_websocket_message_serialization() -> serde_json::Result<()> {
+        let iterations = std::env::var("WS_SERIALIZATION_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5_000);
+        let payload = sample_connections_payload(64 * 1024);
+
+        let old_started = Instant::now();
+        let mut old_len = 0usize;
+        for _ in 0..iterations {
+            let value = serde_json::to_value(OldChannelMessage::Text(std::hint::black_box(payload.clone())))?;
+            let json = serde_json::to_string(&value)?;
+            old_len = old_len.wrapping_add(std::hint::black_box(json.len()));
+        }
+        let old_elapsed = old_started.elapsed();
+
+        let raw_started = Instant::now();
+        let mut raw_len = 0usize;
+        for _ in 0..iterations {
+            raw_len = raw_len.wrapping_add(std::hint::black_box(raw_channel_body_len(std::hint::black_box(
+                &payload,
+            ))));
+        }
+        let raw_elapsed = raw_started.elapsed();
+
+        println!(
+            "payload={}B iterations={} old={:?} raw={:?} raw_speedup={:.2}x old_len={} raw_len={}",
+            payload.len(),
+            iterations,
+            old_elapsed,
+            raw_elapsed,
+            old_elapsed.as_secs_f64() / raw_elapsed.as_secs_f64(),
+            old_len,
+            raw_len
+        );
         Ok(())
     }
 }

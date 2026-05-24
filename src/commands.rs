@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 
-use tauri::{State, async_runtime::RwLock, command, ipc::Channel};
+use tauri::{
+    State,
+    async_runtime::RwLock,
+    command,
+    ipc::{Channel, InvokeResponseBody},
+};
 
 use crate::{Result, mihomo::Mihomo, models::*};
 
@@ -233,7 +238,7 @@ pub(crate) async fn upgrade_geo(state: State<'_, RwLock<Mihomo>>) -> Result<()> 
 #[command]
 pub(crate) async fn ws_traffic(
     state: State<'_, RwLock<Mihomo>>,
-    on_message: Channel<serde_json::Value>,
+    on_message: Channel<InvokeResponseBody>,
 ) -> Result<ConnectionId> {
     state
         .read()
@@ -245,7 +250,7 @@ pub(crate) async fn ws_traffic(
 #[command]
 pub(crate) async fn ws_memory(
     state: State<'_, RwLock<Mihomo>>,
-    on_message: Channel<serde_json::Value>,
+    on_message: Channel<InvokeResponseBody>,
 ) -> Result<ConnectionId> {
     state
         .read()
@@ -257,7 +262,7 @@ pub(crate) async fn ws_memory(
 #[command]
 pub(crate) async fn ws_connections(
     state: State<'_, RwLock<Mihomo>>,
-    on_message: Channel<serde_json::Value>,
+    on_message: Channel<InvokeResponseBody>,
 ) -> Result<ConnectionId> {
     state
         .read()
@@ -270,7 +275,7 @@ pub(crate) async fn ws_connections(
 pub(crate) async fn ws_logs(
     state: State<'_, RwLock<Mihomo>>,
     level: LogLevel,
-    on_message: Channel<serde_json::Value>,
+    on_message: Channel<InvokeResponseBody>,
 ) -> Result<ConnectionId> {
     state
         .read()
@@ -278,16 +283,6 @@ pub(crate) async fn ws_logs(
         .ws_logs_checked(level, move |data| on_message.send(data).is_ok())
         .await
 }
-
-// mihomo 的 websocket 应该只读取数据，没必要发送数据
-// #[command]
-// pub(crate) async fn ws_send(
-//     state: State<'_, RwLock<Mihomo>>,
-//     id: u32,
-//     message: WebSocketMessage,
-// ) -> Result<()> {
-//     state.read().await.send(id, message).await
-// }
 
 #[command]
 pub(crate) async fn ws_disconnect(
