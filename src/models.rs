@@ -108,7 +108,6 @@ pub struct BaseConfig {
     pub tcp_concurrent: bool,
     pub find_process_mode: FindProcessMode,
     pub sniffing: bool,
-    pub global_client_fingerprint: String,
     pub global_ua: String,
     pub etag_support: bool,
     pub keep_alive_interval: isize,
