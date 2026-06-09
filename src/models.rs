@@ -2,6 +2,7 @@ use std::{collections::HashMap, fmt::Display};
 
 use futures_util::{SinkExt, stream::SplitSink};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::{net::TcpStream, sync::RwLock};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use ts_rs::TS;
@@ -12,11 +13,13 @@ macro_rules! string_enum {
     (
         $(#[$enum_meta:meta])*
         pub enum $name:ident {
+            $first_variant:ident => $first_value:literal,
             $($variant:ident => $value:literal,)*
         }
     ) => {
         $(#[$enum_meta])*
         pub enum $name {
+            $first_variant,
             $($variant,)*
             Unknown(String),
         }
@@ -24,6 +27,7 @@ macro_rules! string_enum {
         impl $name {
             pub fn as_str(&self) -> &str {
                 match self {
+                    Self::$first_variant => $first_value,
                     $(Self::$variant => $value,)*
                     Self::Unknown(value) => value,
                 }
@@ -40,18 +44,19 @@ macro_rules! string_enum {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
                 let value = String::deserialize(deserializer)?;
                 Ok(match value.as_str() {
+                    $first_value => Self::$first_variant,
                     $($value => Self::$variant,)*
                     _ => Self::Unknown(value),
                 })
             }
         }
+
     };
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
-    #[default]
     Http,
     LocalSocket,
 }
@@ -113,6 +118,10 @@ pub struct BaseConfig {
     pub keep_alive_interval: isize,
     pub keep_alive_idle: isize,
     pub disable_keep_alive: bool,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub unknown_fields: HashMap<String, Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -168,7 +177,11 @@ pub struct TunConfig {
 
     #[ts(optional)]
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub loopback_address: Option<String>,
+    pub auto_redirect_iproute2_fallback_rule_index: Option<isize>,
+
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub loopback_address: Option<Vec<String>>,
 
     #[ts(optional)]
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -244,6 +257,14 @@ pub struct TunConfig {
 
     #[ts(optional)]
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub include_mac_address: Option<Vec<String>>,
+
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub exclude_mac_address: Option<Vec<String>>,
+
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub endpoint_independent_nat: Option<bool>,
 
     #[ts(optional)]
@@ -251,7 +272,11 @@ pub struct TunConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub udp_timeout: Option<i64>,
 
-    pub file_descriptor: u32,
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub disable_icmp_forwarding: Option<bool>,
+
+    pub file_descriptor: isize,
 
     // The following `inet*` fields will be deprecated
     // refer: https://wiki.metacubex.one/config/inbound/tun/#_1
@@ -279,9 +304,14 @@ pub struct TunConfig {
     #[ts(optional)]
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sendmsgx: Option<bool>,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub unknown_fields: HashMap<String, Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export, rename_all = "camelCase")]
 #[serde(rename_all(serialize = "camelCase", deserialize = "kebab-case"))]
 pub struct TuicServer {
@@ -295,6 +325,14 @@ pub struct TuicServer {
     #[ts(optional)]
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub users: Option<HashMap<String, String>>,
+
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub client_auth_type: Option<String>,
+
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub client_auth_cert: Option<String>,
 
     pub certificate: String,
     pub private_key: String,
@@ -330,10 +368,19 @@ pub struct TuicServer {
 
     #[ts(optional)]
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bbr_profile: Option<String>,
+
+    #[ts(optional)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub mux_option: Option<MuxOption>,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct MuxOption {
     #[ts(optional)]
@@ -345,7 +392,8 @@ pub struct MuxOption {
     pub brutal: Option<BrutalOption>,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct BrutalOption {
     pub enabled: bool,
@@ -361,7 +409,6 @@ pub struct BrutalOption {
 
 #[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
-#[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     DEBUG,
     INFO,
@@ -383,7 +430,8 @@ impl Display for LogLevel {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export, rename_all = "camelCase")]
 #[serde(rename_all(serialize = "camelCase", deserialize = "kebab-case"))]
 pub struct GeoXUrl {
@@ -395,7 +443,6 @@ pub struct GeoXUrl {
 
 #[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
-#[serde(rename_all = "lowercase")]
 pub enum FindProcessMode {
     Strict,
     Always,
@@ -403,11 +450,16 @@ pub enum FindProcessMode {
 }
 
 /// mihomo version
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct MihomoVersion {
     pub meta: bool,
     pub version: String,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -432,7 +484,6 @@ impl Display for CoreUpdaterChannel {
     }
 }
 
-/// clash mode enum
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(rename_all = "lowercase")]
@@ -453,14 +504,38 @@ impl Display for ClashMode {
     }
 }
 
-/// tun stack enum
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, TS, PartialEq, Eq)]
 #[ts(export)]
 pub enum TunStack {
+    #[ts(rename = "Mixed")]
     Mixed,
-    #[serde(rename = "gVisor")]
+    #[ts(rename = "gVisor")]
     Gvisor,
+    #[ts(rename = "System")]
     System,
+}
+
+impl Serialize for TunStack {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let s = match self {
+            TunStack::Mixed => "Mixed",
+            TunStack::Gvisor => "gVisor",
+            TunStack::System => "System",
+        };
+        serializer.serialize_str(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for TunStack {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "Mixed" => Ok(Self::Mixed),
+            "gVisor" => Ok(Self::Gvisor),
+            "System" => Ok(Self::System),
+            _ => Err(serde::de::Error::custom("invalid tun stack")),
+        }
+    }
 }
 
 impl Display for TunStack {
@@ -475,7 +550,8 @@ impl Display for TunStack {
 }
 
 /// group proxies
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct Groups {
     pub proxies: Vec<Proxy>,
@@ -538,7 +614,14 @@ pub struct Proxy {
     pub dialer_proxy: String,
 
     #[serde(rename(serialize = "routingMark", deserialize = "routing-mark"))]
-    pub routing_mark: i8,
+    pub routing_mark: i32,
+
+    #[serde(rename(serialize = "providerName", deserialize = "provider-name"))]
+    pub provider_name: String,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub unknown_fields: HashMap<String, Value>,
 }
 
 string_enum! {
@@ -551,6 +634,7 @@ string_enum! {
         RejectDrop => "RejectDrop",
         Compatible => "Compatible",
         Pass => "Pass",
+        PassRule => "PassRule",
         Dns => "Dns",
         Shadowsocks => "Shadowsocks",
         ShadowsocksR => "ShadowsocksR",
@@ -581,14 +665,16 @@ string_enum! {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct Extra {
     pub alive: bool,
     pub history: Vec<DelayHistory>,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct DelayHistory {
     pub time: String,
@@ -596,7 +682,8 @@ pub struct DelayHistory {
 }
 
 /// proxies
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct Proxies {
     pub proxies: HashMap<String, Proxy>,
@@ -605,13 +692,15 @@ pub struct Proxies {
 /// proxy delay result
 ///
 /// displays a message if it times out, otherwise it only displays the delay
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct ProxyDelay {
     pub delay: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct ProxyProviders {
     pub providers: HashMap<String, ProxyProvider>,
@@ -646,9 +735,14 @@ pub struct ProxyProvider {
     pub expected_status: String,
     pub updated_at: Option<String>,
     pub subscription_info: Option<SubScriptionInfo>,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 #[serde(rename_all = "PascalCase")]
 pub struct SubScriptionInfo {
@@ -663,7 +757,8 @@ pub struct SubScriptionInfo {
 }
 
 /// rules
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct Rules {
     pub rules: Vec<Rule>,
@@ -674,49 +769,61 @@ pub struct Rules {
 pub struct Rule {
     #[serde(rename = "type")]
     pub rule_type: RuleType,
+    pub index: i32,
     pub payload: String,
     pub proxy: String,
     pub size: i32,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-pub enum RuleType {
-    Domain,
-    DomainSuffix,
-    DomainKeyword,
-    DomainRegex,
-    GeoSite,
-    GeoIP,
-    SrcGeoIP,
-    IPASN,
-    SrcIPASN,
-    IPCIDR,
-    SrcIPCIDR,
-    IPSuffix,
-    SrcIPSuffix,
-    SrcPort,
-    DstPort,
-    InPort,
-    InUser,
-    InName,
-    InType,
-    ProcessName,
-    ProcessPath,
-    ProcessNameRegex,
-    ProcessPathRegex,
-    Match,
-    RuleSet,
-    Network,
-    DSCP,
-    Uid,
-    SubRules,
-    AND,
-    OR,
-    NOT,
+string_enum! {
+    #[derive(Debug, TS, PartialEq, Eq)]
+    #[ts(export)]
+    #[ts(type = "string")]
+    pub enum RuleType {
+        Domain => "Domain",
+        DomainSuffix => "DomainSuffix",
+        DomainKeyword => "DomainKeyword",
+        DomainRegex => "DomainRegex",
+        DomainWildcard => "DomainWildcard",
+        GeoSite => "GeoSite",
+        GeoIP => "GeoIP",
+        SrcGeoIP => "SrcGeoIP",
+        IPASN => "IPASN",
+        SrcIPASN => "SrcIPASN",
+        IPCIDR => "IPCIDR",
+        SrcIPCIDR => "SrcIPCIDR",
+        IPSuffix => "IPSuffix",
+        SrcIPSuffix => "SrcIPSuffix",
+        SrcPort => "SrcPort",
+        DstPort => "DstPort",
+        InPort => "InPort",
+        DSCP => "DSCP",
+        InUser => "InUser",
+        InName => "InName",
+        InType => "InType",
+        ProcessName => "ProcessName",
+        ProcessPath => "ProcessPath",
+        ProcessNameRegex => "ProcessNameRegex",
+        ProcessPathRegex => "ProcessPathRegex",
+        ProcessNameWildcard => "ProcessNameWildcard",
+        ProcessPathWildcard => "ProcessPathWildcard",
+        Match => "Match",
+        RuleSet => "RuleSet",
+        Network => "Network",
+        Uid => "Uid",
+        SubRules => "SubRules",
+        AND => "AND",
+        OR => "OR",
+        NOT => "NOT",
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct RuleProviders {
     pub providers: HashMap<String, RuleProvider>,
@@ -754,6 +861,10 @@ pub struct RuleProvider {
     pub provider_type: ProviderType,
     pub updated_at: String,
     pub vehicle_type: VehicleType,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, Value>,
 }
 
 /// connections
@@ -766,7 +877,11 @@ pub struct Connections {
     #[ts(type = "number")]
     pub upload_total: u64,
     pub connections: Option<Vec<Connection>>,
-    pub memory: u32,
+    pub memory: u64,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -781,19 +896,25 @@ pub struct Connection {
     pub download: u64,
     pub start: String,
     pub chains: Vec<String>,
+    #[serde(default)]
+    pub provider_chains: Option<Vec<String>>,
     pub rule: String,
     pub rule_payload: String,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-pub enum Network {
-    #[serde(rename = "tcp")]
-    TCP,
-    #[serde(rename = "udp")]
-    UDP,
-    #[serde(rename = "all")]
-    ALLNet,
+string_enum! {
+    #[derive(Debug, TS, PartialEq, Eq)]
+    #[ts(export)]
+    #[ts(type = "string")]
+    pub enum Network {
+        TCP => "tcp",
+        UDP => "udp",
+        ALLNet => "all",
+    }
 }
 
 string_enum! {
@@ -806,6 +927,7 @@ string_enum! {
         SOCKS4 => "Socks4",
         SOCKS5 => "Socks5",
         SHADOWSOCKS => "ShadowSocks",
+        SNELL => "Snell",
         VMESS => "Vmess",
         VLESS => "Vless",
         REDIR => "Redir",
@@ -816,21 +938,23 @@ string_enum! {
         TUIC => "Tuic",
         HYSTERIA2 => "Hysteria2",
         ANYTLS => "AnyTLS",
+        MIERU => "Mieru",
+        SUDOKU => "Sudoku",
+        TRUSTTUNNEL => "TrustTunnel",
         INNER => "Inner",
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-pub enum DNSMode {
-    #[serde(rename = "normal")]
-    Normal,
-    #[serde(rename = "fake-ip")]
-    FakeIP,
-    #[serde(rename = "redir-host")]
-    Mapping,
-    #[serde(rename = "hosts")]
-    Hosts,
+string_enum! {
+    #[derive(Debug, TS, PartialEq, Eq)]
+    #[ts(export)]
+    #[ts(type = "string")]
+    pub enum DNSMode {
+        Normal => "normal",
+        FakeIP => "fake-ip",
+        Mapping => "redir-host",
+        Hosts => "hosts",
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -879,34 +1003,56 @@ pub struct ConnectionMetaData {
     pub remote_destination: String,
     pub dscp: u8,
     pub sniff_host: String,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct Traffic {
     #[ts(type = "number")]
     pub up: u64,
     #[ts(type = "number")]
     pub down: u64,
+    #[serde(rename = "upTotal")]
+    #[ts(type = "number")]
+    pub up_total: u64,
+    #[serde(rename = "downTotal")]
+    #[ts(type = "number")]
+    pub down_total: u64,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct Memory {
-    pub inuse: u32,
-    pub oslimit: u32,
+    pub inuse: u64,
+    pub oslimit: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, TS, PartialEq, Eq, Default)]
+#[serde(default)]
 #[ts(export)]
 pub struct Log {
     #[serde(rename = "type")]
     pub log_type: String,
     pub payload: String,
+
+    #[ts(skip)]
+    #[serde(flatten, default)]
+    pub extra: HashMap<String, Value>,
 }
 
 // ------------- use in rust, no need export to typescript -----------------
-#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(default)]
 pub struct ErrorResponse {
     pub message: String,
 }
